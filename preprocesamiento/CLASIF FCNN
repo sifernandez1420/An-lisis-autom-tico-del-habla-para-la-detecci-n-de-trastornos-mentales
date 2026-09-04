@@ -1,0 +1,275 @@
+# CLASIFICACIÓN LINEAL OPTIMIZADA UN FOLD A LA VEZ
+
+import pandas as pd
+import numpy as np
+import gc
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import (
+    confusion_matrix, accuracy_score, recall_score,
+    f1_score, roc_auc_score, roc_curve, precision_score
+)
+import matplotlib.pyplot as plt
+from sklearn import svm, model_selection
+from scipy import stats
+
+# ARCHIVOS
+labels_file = "CARACTERISTICAS_RTAS_FILTRADAS/labels_50porc.csv"
+folds_file = "CARACTERISTICAS_RTAS_FILTRADAS/folds_participantes_5s.csv"
+features_files = {
+   # "Prosodia": "CARACTERISTICAS_RTAS_FILTRADAS/prosodia_estadisticos_50porc.csv",
+    "Fonacion": "CARACTERISTICAS_RTAS_FILTRADAS/phonation_estadisticos_50porc.csv",
+   # "Articulacion": "CARACTERISTICAS_RTAS_FILTRADAS/articulation_estadisticos_50porc.csv"
+}
+
+df_labels = pd.read_csv(labels_file)
+df_folds = pd.read_csv(folds_file)
+
+df_labels.columns = df_labels.columns.str.strip()
+df_folds.columns = df_folds.columns.str.strip()
+
+df_labels["pid"] = df_labels["ID PARTICIPANT"].astype(str).str[:3]
+df_folds["pid"] = df_folds["ID PARTICIPANT"].astype(str).str[:3]
+
+
+# FUNCION PRINCIPAL
+def run_fold_cv(X, y, audio_ids, df_folds, kernel, dimension_name):
+    from sklearn.neural_network import MLPClassifier
+
+    # Se guardan métricas globales acumuladas
+    all_true = []
+    all_pred = []
+    all_score = []
+
+    metrics_per_fold = {
+        "Accuracy": [],
+        "Sensibilidad": [],
+        "Especificidad": [],
+        "F1": [],
+        "AUC": [],
+        "Precision": []
+    }
+
+    for fold in range(1, 11):
+
+        print(f"\n==== FOLD {fold} ====")
+
+        train_p = df_folds[df_folds[f"Fold_{fold}"] == "Train"]["pid"].unique()
+        test_p = df_folds[df_folds[f"Fold_{fold}"] == "Test"]["pid"].unique()
+
+        train_idx = [i for i,pid in enumerate(audio_ids) if pid[:3] in train_p]
+        test_idx  = [i for i,pid in enumerate(audio_ids) if pid[:3] in test_p]
+
+        if len(train_idx)==0 or len(test_idx)==0:
+            print(f"Fold {fold} vacío, se omite.")
+            continue
+
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        # ESCALADO
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s  = scaler.transform(X_test)
+   
+
+       # Definir diccionario de hiperparámetros
+       
+ #       param_grid = {
+ #           "hidden_layer_sizes": [(100,), (200,), (200, 100), (300, 200), (200, 150, 100)],
+ #           "activation": ["identity", "relu", "tanh", "logistic"],
+ #           "solver": ["lbfgs", "sgd", "adam"],
+ #           "alpha": [1e-5, 1e-4, 1e-3, 1e-2],
+ #           "learning_rate": ["constant", "invscaling", "adaptive"],
+ #           "max_iter": [100, 200, 300]
+ #       }
+
+        param_grid ={"hidden_layer_sizes": [(64), (16), (64,16)],
+            "activation": ["relu", "tanh"],
+            "alpha": [1e-5, 1e-4, 1e-3, 1e-2],
+            "learning_rate": ["constant", "invscaling", "adaptive"],
+        }
+
+        # Crear el modelo
+        mlp = MLPClassifier(random_state=42)
+
+        # Configurar GridSearchCV
+        grid_for_MLP = GridSearchCV(
+            estimator=mlp,
+            param_grid=param_grid,
+            scoring="balanced_accuracy",     
+            cv=5,                   
+            n_jobs=-1,              
+            verbose=2
+        )
+
+        # Entrenar GridSearch
+        grid_for_MLP.fit(X_train_s, y_train)
+
+        #  Mejor modelo encontrado
+        best_mlp = grid_for_MLP.best_estimator_
+        print("Mejores hiperparámetros encontrados:")
+        print(grid_for_MLP.best_params_)
+
+        # Predecir con el mejor modelo
+        y_pred = best_mlp.predict(X_test_s)
+        y_score = best_mlp.predict_proba(X_test_s)[:, 1]
+
+         # Métricas por fold
+        acc_f = accuracy_score(y_test, y_pred)
+        sens_f = recall_score(y_test, y_pred)
+        spec_f = recall_score(y_test, y_pred, pos_label=0)
+        f1_f = f1_score(y_test, y_pred)
+        prec_f = precision_score(y_test, y_pred, zero_division=0)
+
+        try:
+            auc_f = roc_auc_score(y_test, y_score)
+        except:
+            auc_f = np.nan
+
+        metrics_per_fold["Accuracy"].append(acc_f)
+        metrics_per_fold["Sensibilidad"].append(sens_f)
+        metrics_per_fold["Especificidad"].append(spec_f)
+        metrics_per_fold["F1"].append(f1_f)
+        metrics_per_fold["AUC"].append(auc_f)
+        metrics_per_fold["Precision"].append(prec_f)
+
+        # Guardar resultados por respuesta del fold
+        df_resp = pd.DataFrame({
+            "Fold": fold,
+            "audio_id": [audio_ids[i] for i in test_idx],
+            "y_true": y_test,
+            "y_pred": y_pred,
+            "y_score": y_score
+        })
+        df_resp.to_csv(f"resp_fold{fold}_{dimension_name}.csv", index=False)
+
+        # Agregar para métricas globales
+        all_true.extend(y_test)
+        all_pred.extend(y_pred)
+        all_score.extend(y_score)
+
+        del X_train, X_test, X_train_s, X_test_s, y_train, y_test
+        gc.collect()
+
+     #  METRICAS GLOBALES
+
+    all_true = np.array(all_true)
+    all_pred = np.array(all_pred)
+    all_score = np.array(all_score)
+
+    acc = accuracy_score(all_true, all_pred)
+    sens = recall_score(all_true, all_pred)
+    spec = recall_score(all_true, all_pred, pos_label=0)
+    f1 = f1_score(all_true, all_pred)
+    auc = roc_auc_score(all_true, all_score)
+    prec_global = precision_score(all_true, all_pred, zero_division=0)
+
+    print("\n=== RESULTADOS GLOBALES ===")
+    print(f"{dimension_name}")
+    print(f"Accuracy: {acc:.3f}")
+    print(f"Sensibilidad: {sens:.3f}")
+    print(f"Especificidad: {spec:.3f}")
+    print(f"F1-Score: {f1:.3f}")
+    print(f"AUC-ROC: {auc:.3f}")
+    print(f"Precision: {prec_global:.3f}")
+
+    #  Curva ROC para toda la dimensión 
+    fpr, tpr, _ = roc_curve(all_true, all_score)
+
+    plt.figure(figsize=(6,5))
+    plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}")
+    plt.plot([0,1],[0,1],'--')
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC - {dimension_name}")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f"ROC_{dimension_name}.png")
+    plt.close()
+
+    # --- MEDIA Y DESVIACIÓN ESTÁNDAR POR FOLD ---
+    stats_result = {
+        "Dimension": dimension_name,
+
+        "Accuracy_mean": np.nanmean(metrics_per_fold["Accuracy"]),
+        "Accuracy_std": np.nanstd(metrics_per_fold["Accuracy"]),
+
+        "Sensibilidad_mean": np.nanmean(metrics_per_fold["Sensibilidad"]),
+        "Sensibilidad_std": np.nanstd(metrics_per_fold["Sensibilidad"]),
+
+        "Especificidad_mean": np.nanmean(metrics_per_fold["Especificidad"]),
+        "Especificidad_std": np.nanstd(metrics_per_fold["Especificidad"]),
+
+        "F1_mean": np.nanmean(metrics_per_fold["F1"]),
+        "F1_std": np.nanstd(metrics_per_fold["F1"]),
+
+        "AUC_mean": np.nanmean(metrics_per_fold["AUC"]),
+        "AUC_std": np.nanstd(metrics_per_fold["AUC"]),
+
+        "Precision_mean": np.nanmean(metrics_per_fold["Precision"]),
+        "Precision_std": np.nanstd(metrics_per_fold["Precision"]),
+    }
+
+    # --- RETURN FINAL ---
+    return {
+        "Dimension": dimension_name,
+
+        # GLOBAL
+        "Accuracy_global": acc,
+        "Sensibilidad_global": sens,
+        "Especificidad_global": spec,
+        "F1_global": f1,
+        "AUC_global": auc,
+        "Precision_global": prec_global,
+
+        # FOLD
+        "Accuracy_mean": stats_result["Accuracy_mean"],
+        "Accuracy_std": stats_result["Accuracy_std"],
+
+        "Sensibilidad_mean": stats_result["Sensibilidad_mean"],
+        "Sensibilidad_std": stats_result["Sensibilidad_std"],
+
+        "Especificidad_mean": stats_result["Especificidad_mean"],
+        "Especificidad_std": stats_result["Especificidad_std"],
+
+        "F1_mean": stats_result["F1_mean"],
+        "F1_std": stats_result["F1_std"],
+
+        "AUC_mean": stats_result["AUC_mean"],
+        "AUC_std": stats_result["AUC_std"],
+
+        "Precision_mean": stats_result["Precision_mean"],
+        "Precision_std": stats_result["Precision_std"],
+    }
+
+
+# PROCESAR DIMENSIONES UNA A UNA
+
+global_results = []
+
+for dim_name, file_path in features_files.items():
+    print(f"\n\n=== PROCESANDO DIMENSIÓN: {dim_name} ===")
+
+    df_feat = pd.read_csv(file_path)
+    df_feat.columns = df_feat.columns.str.strip()
+
+    df_feat["id"] = df_feat.iloc[:,0].astype(str).str.strip()
+
+    feature_cols = df_feat.select_dtypes(include=[np.number]).columns
+    df_feat[feature_cols] = df_feat[feature_cols].fillna(df_feat[feature_cols].mean())
+
+    X = df_feat[feature_cols].values
+    y = df_labels["PATOLOGY"].values
+    audio_ids = df_feat["id"].values
+
+    res = run_fold_cv(X, y, audio_ids, df_folds, True, dim_name) #gauss..
+    global_results.append(res)
+
+    gc.collect()
+
+pd.DataFrame(global_results).to_csv("resultados_globales_dimensiones.csv", index=False)
+print("\nArchivo global generado.")
+
