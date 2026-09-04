@@ -1,0 +1,286 @@
+# CLASIFICACIÓN SMV DISVOICE
+
+import pandas as pd
+import numpy as np
+import gc
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import (
+    confusion_matrix, accuracy_score, recall_score,
+    f1_score, roc_auc_score, roc_curve, precision_score
+)
+import matplotlib.pyplot as plt
+from sklearn import svm, model_selection
+from scipy import stats
+
+# ARCHIVOS
+labels_file = "ESTADISTICOS_CARACTERISTICAS_PARTICIPANTE/labels_balanceado_participante_5s.csv"
+folds_file = "ESTADISTICOS_CARACTERISTICAS_PARTICIPANTE/folds_participantes_5s.csv"
+features_files = {
+    "Prosodia": "ESTADISTICOS_CARACTERISTICAS_PARTICIPANTE/prosodia_estadisticos_participante_5s.csv",
+    "Fonacion": "ESTADISTICOS_CARACTERISTICAS_PARTICIPANTE/phonation_estadisticos_participante_5s.csv",
+    "Articulacion": "ESTADISTICOS_CARACTERISTICAS_PARTICIPANTE/articulation_estadisticos_participante_5s.csv"
+}
+
+df_labels = pd.read_csv(labels_file)
+df_folds = pd.read_csv(folds_file)
+
+df_labels.columns = df_labels.columns.str.strip()
+df_folds.columns = df_folds.columns.str.strip()
+
+df_labels["pid"] = df_labels["ID PARTICIPANT"].astype(str).str[:3]
+df_folds["pid"] = df_folds["ID PARTICIPANT"].astype(str).str[:3]
+
+
+# FUNCION PRINCIPAL
+def run_fold_cv(X, y, audio_ids, df_folds, kernel, dimension_name):
+
+    # Se guardan métricas globales acumuladas
+    all_true, all_pred, all_score = [], [], []
+
+    metrics_per_fold = {
+    "Accuracy": [],
+    "Sensibilidad": [],
+    "Especificidad": [],
+    "F1": [],
+    "AUC": [],
+    "Precision": []
+}
+
+    for fold in range(1, 11):
+
+        print(f"\n==== FOLD {fold} ====")
+
+        train_p = df_folds[df_folds[f"Fold_{fold}"] == "Train"]["pid"].unique()
+        test_p = df_folds[df_folds[f"Fold_{fold}"] == "Test"]["pid"].unique()
+
+        train_idx = [i for i,pid in enumerate(audio_ids) if pid[:3] in train_p]
+        test_idx  = [i for i,pid in enumerate(audio_ids) if pid[:3] in test_p]
+
+        if len(train_idx)==0 or len(test_idx)==0:
+            print(f"Fold {fold} vacío, se omite.")
+            continue
+
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s  = scaler.transform(X_test)
+
+        # VALIDACION CRUZADA ANIDADA
+        inner_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+        C_array =np.geomspace(1e-6,1e6,13)#np.geomspace(1e-4,1e3,8)
+        G_array=np.geomspace(1e-6,1e6,13)
+        
+        #Best parameters and testSet
+        if kernel:
+            parameters = {'kernel':['linear'], 'C':C_array}
+            svc = svm.SVC(class_weight = 'balanced')
+            clf = model_selection.GridSearchCV(svc, parameters, cv=inner_cv, n_jobs = -1, scoring='balanced_accuracy')
+            clf.fit(X_train_s,y_train)                
+            best_C=clf.best_estimator_.C
+            parameters2 = {'kernel':['linear'],
+            'C':stats.expon(scale=best_C)}
+            svc = svm.SVC(class_weight = 'balanced')
+            clf_random = model_selection.RandomizedSearchCV(svc, parameters2, n_jobs=-1, cv=inner_cv, verbose=1, n_iter=1000, scoring='balanced_accuracy')
+            clf_random.fit(X_train_s,y_train)
+        else:
+            parameters = {'kernel':['rbf'], 'C':C_array, 'gamma': G_array}
+            svc = svm.SVC(class_weight = 'balanced')
+            clf = model_selection.GridSearchCV(svc, parameters, cv=inner_cv, n_jobs = -1, scoring='balanced_accuracy')
+            clf.fit(X_train_s,y_train) 
+            best_C=clf.best_estimator_.C
+            best_G = clf.best_estimator_.gamma               
+            parameters2 = {'kernel':['rbf'],
+                'C':stats.expon(scale=best_C),
+                'gamma':stats.expon(scale=best_G)}
+            svc = svm.SVC(class_weight = 'balanced')
+            clf_random = model_selection.RandomizedSearchCV(svc, parameters2, n_jobs=-1, cv=inner_cv, verbose=1, n_iter=1000, scoring='balanced_accuracy')
+            clf_random.fit(X_train_s,y_train)
+
+ 
+
+        if kernel:
+            SVM_Classifier = svm.SVC(kernel = 'linear' , C=clf_random.best_params_['C'], class_weight = 'balanced')
+        else:    
+            SVM_Classifier = svm.SVC(kernel = 'rbf' , gamma=clf_random.best_params_['gamma'], C=clf_random.best_params_['C'], class_weight = 'balanced')
+    
+
+
+        print("Mejor hiperparámetro:", clf.best_params_)
+
+        SVM_Classifier.fit(X_train_s,y_train) 
+
+        y_pred = SVM_Classifier.predict(X_test_s)
+        y_score = SVM_Classifier.decision_function(X_test_s)
+
+         # Métricas por fold
+        acc_f = accuracy_score(y_test, y_pred)
+        sens_f = recall_score(y_test, y_pred)
+        spec_f = recall_score(y_test, y_pred, pos_label=0)
+        f1_f = f1_score(y_test, y_pred)
+        prec_f = precision_score(y_test, y_pred, zero_division=0)
+
+
+        # AUC del fold
+        try:
+          auc_f = roc_auc_score(y_test, y_score)
+        except:
+          auc_f = np.nan  # Por si algún fold tiene sólo un tipo de etiqueta
+
+        # Guardar
+        metrics_per_fold["Accuracy"].append(acc_f)
+        metrics_per_fold["Sensibilidad"].append(sens_f)
+        metrics_per_fold["Especificidad"].append(spec_f)
+        metrics_per_fold["F1"].append(f1_f)
+        metrics_per_fold["AUC"].append(auc_f)
+        metrics_per_fold["Precision"].append(prec_f)
+
+
+
+        # Guardar resultados por respuesta del fold
+        df_resp = pd.DataFrame({
+            "Fold": fold,
+            "audio_id": [audio_ids[i] for i in test_idx],
+            "y_true": y_test,
+            "y_pred": y_pred,
+            "y_score": y_score
+        })
+        df_resp.to_csv(f"resp_fold{fold}_{dimension_name}.csv", index=False)
+
+        # Agregar para métricas globales
+        all_true.extend(y_test)
+        all_pred.extend(y_pred)
+        all_score.extend(y_score)
+
+        # Liberar memoria del fold
+        del X_train, X_test, X_train_s, X_test_s, y_train, y_test
+        gc.collect()
+
+      # METRICAS GLOBALES
+
+    all_true = np.array(all_true)
+    all_pred = np.array(all_pred)
+    all_score = np.array(all_score)
+
+    acc = accuracy_score(all_true, all_pred)
+    sens = recall_score(all_true, all_pred)
+    spec = recall_score(all_true, all_pred, pos_label=0)
+    f1 = f1_score(all_true, all_pred)
+    auc = roc_auc_score(all_true, all_score)
+    prec_global = precision_score(all_true, all_pred, zero_division=0)
+
+
+    print("\n=== RESULTADOS GLOBALES ===")
+    print(f"{dimension_name}")
+    print(f"Accuracy: {acc:.3f}")
+    print(f"Sensibilidad: {sens:.3f}")
+    print(f"Especificidad: {spec:.3f}")
+    print(f"F1-Score: {f1:.3f}")
+    print(f"AUC-ROC: {auc:.3f}")
+    print(f"Precision: {prec_global:.3f}")
+
+
+    # --- Curva ROC para toda la dimensión ---
+    fpr, tpr, _ = roc_curve(all_true, all_score)
+
+    plt.figure(figsize=(6,5))
+    plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}")
+    plt.plot([0,1],[0,1],'--')
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC - {dimension_name}")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f"ROC_{dimension_name}.png")
+    plt.close()
+
+    # Estadísticos por fold: media y desviación estándar
+       # --- Estadísticos por fold: media y desviación estándar ---
+    stats_result = {
+        "Dimension": dimension_name,
+
+        "Accuracy_mean": np.nanmean(metrics_per_fold["Accuracy"]),
+        "Accuracy_std": np.nanstd(metrics_per_fold["Accuracy"]),
+
+        "Sensibilidad_mean": np.nanmean(metrics_per_fold["Sensibilidad"]),
+        "Sensibilidad_std": np.nanstd(metrics_per_fold["Sensibilidad"]),
+
+        "Especificidad_mean": np.nanmean(metrics_per_fold["Especificidad"]),
+        "Especificidad_std": np.nanstd(metrics_per_fold["Especificidad"]),
+
+        "F1_mean": np.nanmean(metrics_per_fold["F1"]),
+        "F1_std": np.nanstd(metrics_per_fold["F1"]),
+
+        "AUC_mean": np.nanmean(metrics_per_fold["AUC"]),
+        "AUC_std": np.nanstd(metrics_per_fold["AUC"]),
+
+        "Precision_mean": np.nanmean(metrics_per_fold["Precision"]),
+        "Precision_std": np.nanstd(metrics_per_fold["Precision"]),
+
+    }
+
+    # --- RETURN FINAL (todo dentro de la función) ---
+    return {
+        "Dimension": dimension_name,
+
+        # MÉTRICAS GLOBALES 
+        "Accuracy_global": acc,
+        "Sensibilidad_global": sens,
+        "Especificidad_global": spec,
+        "F1_global": f1,
+        "AUC_global": auc,
+        "Precision_global": prec_global,
+
+
+        #  MÉTRICAS POR FOLD 
+        "Accuracy_mean": stats_result["Accuracy_mean"],
+        "Accuracy_std": stats_result["Accuracy_std"],
+
+        "Sensibilidad_mean": stats_result["Sensibilidad_mean"],
+        "Sensibilidad_std": stats_result["Sensibilidad_std"],
+
+        "Especificidad_mean": stats_result["Especificidad_mean"],
+        "Especificidad_std": stats_result["Especificidad_std"],
+
+        "F1_mean": stats_result["F1_mean"],
+        "F1_std": stats_result["F1_std"],
+
+        "AUC_mean": stats_result["AUC_mean"],
+        "AUC_std": stats_result["AUC_std"],
+
+        "Precision_mean": stats_result["Precision_mean"],
+        "Precision_std": stats_result["Precision_std"],
+
+    }
+
+# PROCESAR DIMENSIONES UNA A UNA
+
+global_results = []
+
+for dim_name, file_path in features_files.items():
+    print(f"\n\n=== PROCESANDO DIMENSIÓN: {dim_name} ===")
+
+    df_feat = pd.read_csv(file_path)
+    df_feat.columns = df_feat.columns.str.strip()
+
+    df_feat["id"] = df_feat.iloc[:,0].astype(str).str.strip()
+
+    feature_cols = df_feat.select_dtypes(include=[np.number]).columns
+    df_feat[feature_cols] = df_feat[feature_cols].fillna(df_feat[feature_cols].mean())
+
+    X = df_feat[feature_cols].values
+    y = df_labels["PATOLOGY"].values
+    audio_ids = df_feat["id"].values
+
+    res = run_fold_cv(X, y, audio_ids, df_folds, True, dim_name) # True=lineal,False=gauss
+    global_results.append(res)
+
+    gc.collect()
+
+pd.DataFrame(global_results).to_csv("resultados_globales_dimensiones.csv", index=False)
+print("\nArchivo global generado.")
